@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
 import base64
+import os
 import uvicorn
 
 app = FastAPI()
@@ -458,30 +459,168 @@ def is_multicolor_cad(bgr):
     return strong >= 3
 
 
-def as_is_clear_display(bgr, min_long=1600, max_long=4096):
-    """
-    Exact CAD look (like source). Only upscale tiny scans — no ink morph,
-    no heavy unsharp (those create dashed gaps and overly dark lines).
-    """
-    h, w = bgr.shape[:2]
-    long_edge = max(h, w)
-    out = bgr.copy()
+def estimate_sharpness(bgr):
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    if long_edge < min_long:
-        scale = min(2.5, min_long / float(long_edge))
+
+_SR_CACHE = {}
+
+
+def _espcn_model_path(scale=4):
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "models", f"ESPCN_x{scale}.pb")
+
+
+def ai_upscale_espcn(bgr, scale=4):
+    """
+    AI super-resolution (Upscale.media-style): ESPCN reconstructs detail
+    instead of simple stretch. Falls back to None if model missing.
+    """
+    path = _espcn_model_path(scale)
+    if not os.path.isfile(path):
+        return None
+    try:
+        from cv2 import dnn_superres
+        key = (path, scale)
+        if key not in _SR_CACHE:
+            sr = dnn_superres.DnnSuperResImpl_create()
+            sr.readModel(path)
+            sr.setModel("espcn", scale)
+            _SR_CACHE[key] = sr
+        # Large images: tile to avoid OOM
+        h, w = bgr.shape[:2]
+        if h * w > 900_000:
+            fit = 800 / float(max(h, w))
+            if fit < 1:
+                small = cv2.resize(
+                    bgr,
+                    (max(1, int(round(w * fit))), max(1, int(round(h * fit)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                return _SR_CACHE[key].upsample(small)
+        return _SR_CACHE[key].upsample(bgr)
+    except Exception:
+        return None
+
+
+def upscale_lanczos_steps(bgr, target_long):
+    """Fallback stepwise 2× Lanczos when AI model unavailable."""
+    out = bgr.copy()
+    guard = 0
+    while max(out.shape[:2]) * 2 <= target_long and guard < 5:
+        guard += 1
+        h, w = out.shape[:2]
+        out = cv2.resize(out, (w * 2, h * 2), interpolation=cv2.INTER_LANCZOS4)
+    h, w = out.shape[:2]
+    long_edge = max(h, w)
+    if long_edge < target_long:
+        scale = target_long / float(long_edge)
         out = cv2.resize(
             out,
             (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
             interpolation=cv2.INTER_LANCZOS4,
         )
-    elif long_edge > max_long:
-        scale = max_long / float(long_edge)
+    elif long_edge > target_long:
+        scale = target_long / float(long_edge)
         out = cv2.resize(
             out,
             (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
             interpolation=cv2.INTER_AREA,
         )
     return out
+
+
+def clarity_boost(bgr):
+    """Upscale.media-like clarity: denoise + edge restore + contrast, keep colors."""
+    out = cv2.bilateralFilter(bgr, d=5, sigmaColor=30, sigmaSpace=30)
+
+    gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+
+    # Reconnect micro-gaps in thin dark CAD strokes after upscale
+    ink = (gray <= 165) & (sat < 55)
+    soft = (gray > 165) & (gray < 220) & (sat < 40)
+    near = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1) > 0
+    ink_mask = ((ink | (soft & near)).astype(np.uint8) * 255)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    ink_mask = cv2.morphologyEx(ink_mask, cv2.MORPH_CLOSE, k, iterations=2)
+    gap = (ink_mask > 0) & (gray >= 175) & (sat < 45)
+    if np.any(gap):
+        out[gap] = (55, 55, 55)
+    real_ink = ink & (gray <= 140)
+    if np.any(real_ink):
+        deepened = np.maximum(out[real_ink].astype(np.int16) - 12, 25)
+        out[real_ink] = deepened.astype(np.uint8)
+
+    lab = cv2.cvtColor(out, cv2.COLOR_BGR2LAB)
+    l, a, bch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    out = cv2.cvtColor(cv2.merge([l2, a, bch]), cv2.COLOR_LAB2BGR)
+
+    blur = cv2.GaussianBlur(out, (0, 0), 0.75)
+    out = cv2.addWeighted(out, 1.28, blur, -0.28, 0)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def enhance_low_quality_to_hq(bgr, target_long=2800, max_long=4096):
+    """
+    Upscale.media-style: low-quality / blurry / pixelated → high-quality clear.
+    1) AI ESPCN ×4 super-resolution when model present
+    2) Fit to target resolution
+    3) Clarity boost (sharpen + line heal)
+    """
+    h0, w0 = bgr.shape[:2]
+    long0 = max(h0, w0)
+    sharp0 = estimate_sharpness(bgr)
+    was_low = long0 < target_long or sharp0 < 150.0
+
+    out = bgr.copy()
+    used_ai = False
+
+    if was_low and long0 < target_long:
+        ai = ai_upscale_espcn(out, scale=4)
+        if ai is not None:
+            out = ai
+            used_ai = True
+        else:
+            out = upscale_lanczos_steps(out, target_long)
+
+        if max(out.shape[:2]) < target_long:
+            out = upscale_lanczos_steps(out, target_long)
+        elif max(out.shape[:2]) > max_long:
+            scale = max_long / float(max(out.shape[:2]))
+            h, w = out.shape[:2]
+            out = cv2.resize(
+                out,
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+    elif long0 > max_long:
+        scale = max_long / float(long0)
+        out = cv2.resize(
+            out,
+            (max(1, int(round(w0 * scale))), max(1, int(round(h0 * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    if was_low:
+        out = clarity_boost(out)
+
+    return out, was_low, used_ai
+
+
+def as_is_clear_display(bgr, min_long=1600, max_long=4096):
+    """
+    Produce high-quality clear output for SVG (Upscale.media-style enhance).
+    Returns (image, was_low, used_ai).
+    """
+    hq, was_low, used_ai = enhance_low_quality_to_hq(
+        bgr, target_long=max(min_long, 2800), max_long=max_long
+    )
+    return hq, was_low, used_ai
 
 
 def prepare_for_vectorize(bgr, max_dim=2000):
@@ -672,20 +811,18 @@ async def trace_image(
     if do_strip:
         bgr, bg_removed = isolate_main_drawing(bgr)
 
-    # ALWAYS as-it-is for display/SVG embed — crisp morph causes dash-gaps + dark lines.
-    # Paths are optional for editing; cleaned_image must match source clarity.
-    display = as_is_clear_display(bgr, min_long=1600, max_long=4096)
-    quality = "as-is"
+    # Upscale.media-style: low-quality → AI/HQ clear for SVG
+    display, was_low, used_ai = as_is_clear_display(bgr, min_long=1600, max_long=4096)
+    quality = "hq" if was_low else "as-is"
 
     disp_h, disp_w = display.shape[:2]
-    prepared = prepare_for_vectorize(display, max_dim=2400)
+    prepared = prepare_for_vectorize(display, max_dim=2800)
     prev_h, prev_w = prepared.shape[:2]
 
     if mode == "centerline":
         paths = trace_centerline(prepared)
         svg_doc = paths_to_svg(paths, prev_w, prev_h)
     else:
-        # Prefer real color paths; if tracer fails, still return clear as-is image
         vt_paths, vt_svg = vectorize_with_vtracer(prepared)
         if vt_paths:
             paths = vt_paths
@@ -707,6 +844,8 @@ async def trace_image(
         "background_removed": bg_removed,
         "mode": mode,
         "quality": quality,
+        "enhanced": was_low,
+        "ai_upscale": used_ai,
         "vectorize": True,
     }
 
